@@ -1,6 +1,6 @@
 use crate::core::compiler::{CompileKind, CompileMode, Layout, RustcTargetData};
 use crate::core::profiles::Profiles;
-use crate::core::{PackageIdSpec, TargetKind, Workspace};
+use crate::core::{Package, PackageIdSpec, TargetKind, Workspace};
 use crate::ops;
 use crate::util::errors::CargoResult;
 use crate::util::interning::InternedString;
@@ -33,9 +33,8 @@ pub fn clean(ws: &Workspace<'_>, opts: &CleanOptions<'_>) -> CargoResult<()> {
 
     // If the doc option is set, we just want to delete the doc directory.
     if opts.doc {
-        let mut progress = Progress::with_style("Cleaning", ProgressStyle::Percentage, config);
         target_dir = target_dir.join("doc");
-        return rm_rf_with_progress(&target_dir.into_path_unlocked(), &mut progress);
+        return rm_rf_with_progress(&target_dir.into_path_unlocked(), &config);
     }
 
     let profiles = Profiles::new(ws, opts.requested_profile)?;
@@ -54,8 +53,7 @@ pub fn clean(ws: &Workspace<'_>, opts: &CleanOptions<'_>) -> CargoResult<()> {
     // Note that we don't bother grabbing a lock here as we're just going to
     // blow it all away anyway.
     if opts.spec.is_empty() {
-        let mut progress = Progress::with_style("Cleaning", ProgressStyle::Percentage, config);
-        return rm_rf_with_progress(&target_dir.into_path_unlocked(), &mut progress);
+        return rm_rf_with_progress(&target_dir.into_path_unlocked(), &config);
     }
 
     // Clean specific packages.
@@ -135,81 +133,158 @@ pub fn clean(ws: &Workspace<'_>, opts: &CleanOptions<'_>) -> CargoResult<()> {
     }
     let packages = pkg_set.get_many(pkg_ids)?;
 
-    let mut progress = Progress::with_style("Cleaning", ProgressStyle::Ratio, config);
-    for (pkg_idx, pkg) in packages.iter().enumerate() {
-        let pkg_dir = format!("{}-*", pkg.name());
-        progress.tick_now(pkg_idx + 1, packages.len(), &format!(": {}", pkg.name()))?;
+    // Count total of paths to be deleted for the progress bar
+    let mut total_to_remove = 0;
+    for pkg in &packages {
+        foreach_package_entry(
+            pkg,
+            &layouts_with_host,
+            &layouts,
+            &target_data,
+            |glob_or_path| {
+                match glob_or_path {
+                    GlobOrPath::Glob(ref glob) => total_to_remove += count_paths_in_glob(glob)?,
+                    GlobOrPath::Path(ref path) => total_to_remove += count_paths_in(path),
+                };
+                Ok(())
+            },
+        )?;
+    }
+    let mut progress = CleaningProgressBar::new(config, total_to_remove);
 
-        // Clean fingerprints.
-        for (_, layout) in &layouts_with_host {
-            let dir = escape_glob_path(layout.fingerprint())?;
-            rm_rf_glob(&Path::new(&dir).join(&pkg_dir), config)?;
+    for pkg in &packages {
+        progress.msg = format!(": {}", pkg.name());
+        foreach_package_entry(
+            pkg,
+            &layouts_with_host,
+            &layouts,
+            &target_data,
+            |glob_or_path| match glob_or_path {
+                GlobOrPath::Glob(ref glob) => rm_rf_glob(glob, config, &mut progress),
+                GlobOrPath::Path(ref path) => rm_rf(path, config, &mut progress),
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+// Wrapper around Progress to make it easier to work with
+struct CleaningProgressBar<'cfg> {
+    bar: Progress<'cfg>,
+    max: usize,
+    cur: usize,
+    msg: String,
+}
+
+impl<'cfg> CleaningProgressBar<'cfg> {
+    fn new(cfg: &'cfg Config, max: usize) -> CleaningProgressBar<'cfg> {
+        CleaningProgressBar {
+            bar: Progress::with_style("Cleaning", ProgressStyle::Percentage, cfg),
+            max,
+            cur: 0,
+            msg: String::new(),
         }
+    }
 
-        for target in pkg.targets() {
-            if target.is_custom_build() {
-                // Get both the build_script_build and the output directory.
-                for (_, layout) in &layouts_with_host {
-                    let dir = escape_glob_path(layout.build())?;
-                    rm_rf_glob(&Path::new(&dir).join(&pkg_dir), config)?;
-                }
-                continue;
+    fn tick(&mut self) -> CargoResult<()> {
+        self.cur += 1;
+        self.bar
+            .tick(std::cmp::min(self.cur, self.max), self.max, &self.msg)
+    }
+
+    fn display_now(&mut self) -> CargoResult<()> {
+        self.bar
+            .tick_now(std::cmp::min(self.cur, self.max), self.max, &self.msg)
+    }
+}
+
+enum GlobOrPath<'a> {
+    Glob(&'a Path),
+    Path(&'a Path),
+}
+
+fn foreach_package_entry(
+    pkg: &Package,
+    layouts_with_host: &[(CompileKind, &Layout)],
+    layouts: &[(CompileKind, &Layout)],
+    target_data: &RustcTargetData<'_>,
+    mut f: impl FnMut(GlobOrPath<'_>) -> CargoResult<()>,
+) -> CargoResult<()> {
+    let pkg_dir = format!("{}-*", pkg.name());
+
+    // Clean fingerprints.
+    for (_, layout) in layouts_with_host {
+        let dir = escape_glob_path(layout.fingerprint())?;
+
+        f(GlobOrPath::Glob(&Path::new(&dir).join(&pkg_dir)))?;
+    }
+
+    for target in pkg.targets() {
+        if target.is_custom_build() {
+            // Get both the build_script_build and the output directory.
+            for (_, layout) in layouts_with_host {
+                let dir = escape_glob_path(layout.build())?;
+                f(GlobOrPath::Glob(&Path::new(&dir).join(&pkg_dir)))?;
             }
-            let crate_name = target.crate_name();
-            for &mode in &[
-                CompileMode::Build,
-                CompileMode::Test,
-                CompileMode::Check { test: false },
-            ] {
-                for (compile_kind, layout) in &layouts {
-                    let triple = target_data.short_name(compile_kind);
+            continue;
+        }
+        let crate_name = target.crate_name();
+        for &mode in &[
+            CompileMode::Build,
+            CompileMode::Test,
+            CompileMode::Check { test: false },
+        ] {
+            for (compile_kind, layout) in layouts {
+                let triple = target_data.short_name(compile_kind);
 
-                    let (file_types, _unsupported) = target_data
+                let (file_types, _unsupported) =
+                    target_data
                         .info(*compile_kind)
                         .rustc_outputs(mode, target.kind(), triple)?;
-                    let (dir, uplift_dir) = match target.kind() {
-                        TargetKind::ExampleBin | TargetKind::ExampleLib(..) => {
-                            (layout.examples(), Some(layout.examples()))
-                        }
-                        // Tests/benchmarks are never uplifted.
-                        TargetKind::Test | TargetKind::Bench => (layout.deps(), None),
-                        _ => (layout.deps(), Some(layout.dest())),
-                    };
-                    for file_type in file_types {
-                        // Some files include a hash in the filename, some don't.
-                        let hashed_name = file_type.output_filename(target, Some("*"));
-                        let unhashed_name = file_type.output_filename(target, None);
-                        let dir_glob = escape_glob_path(dir)?;
-                        let dir_glob = Path::new(&dir_glob);
-
-                        rm_rf_glob(&dir_glob.join(&hashed_name), config)?;
-                        rm_rf(&dir.join(&unhashed_name), config)?;
-                        // Remove dep-info file generated by rustc. It is not tracked in
-                        // file_types. It does not have a prefix.
-                        let hashed_dep_info = dir_glob.join(format!("{}-*.d", crate_name));
-                        rm_rf_glob(&hashed_dep_info, config)?;
-                        let unhashed_dep_info = dir.join(format!("{}.d", crate_name));
-                        rm_rf(&unhashed_dep_info, config)?;
-                        // Remove split-debuginfo files generated by rustc.
-                        let split_debuginfo_obj = dir_glob.join(format!("{}.*.o", crate_name));
-                        rm_rf_glob(&split_debuginfo_obj, config)?;
-                        let split_debuginfo_dwo = dir_glob.join(format!("{}.*.dwo", crate_name));
-                        rm_rf_glob(&split_debuginfo_dwo, config)?;
-
-                        // Remove the uplifted copy.
-                        if let Some(uplift_dir) = uplift_dir {
-                            let uplifted_path = uplift_dir.join(file_type.uplift_filename(target));
-                            rm_rf(&uplifted_path, config)?;
-                            // Dep-info generated by Cargo itself.
-                            let dep_info = uplifted_path.with_extension("d");
-                            rm_rf(&dep_info, config)?;
-                        }
+                let (dir, uplift_dir) = match target.kind() {
+                    TargetKind::ExampleBin | TargetKind::ExampleLib(..) => {
+                        (layout.examples(), Some(layout.examples()))
                     }
-                    // TODO: what to do about build_script_build?
-                    let dir = escape_glob_path(layout.incremental())?;
-                    let incremental = Path::new(&dir).join(format!("{}-*", crate_name));
-                    rm_rf_glob(&incremental, config)?;
+                    // Tests/benchmarks are never uplifted.
+                    TargetKind::Test | TargetKind::Bench => (layout.deps(), None),
+                    _ => (layout.deps(), Some(layout.dest())),
+                };
+                for file_type in file_types {
+                    // Some files include a hash in the filename, some don't.
+                    let hashed_name = file_type.output_filename(target, Some("*"));
+                    let unhashed_name = file_type.output_filename(target, None);
+                    let dir_glob = escape_glob_path(dir)?;
+                    let dir_glob = Path::new(&dir_glob);
+
+                    f(GlobOrPath::Glob(&dir_glob.join(&hashed_name)))?;
+                    f(GlobOrPath::Path(&dir.join(&unhashed_name)))?;
+                    // Remove dep-info file generated by rustc. It is not tracked in
+                    // file_types. It does not have a prefix.
+                    let hashed_dep_info = dir_glob.join(format!("{}-*.d", crate_name));
+                    f(GlobOrPath::Glob(&hashed_dep_info))?;
+                    let unhashed_dep_info = dir.join(format!("{}.d", crate_name));
+                    f(GlobOrPath::Path(&unhashed_dep_info))?;
+                    // Remove split-debuginfo files generated by rustc.
+                    let split_debuginfo_obj = dir_glob.join(format!("{}.*.o", crate_name));
+                    f(GlobOrPath::Glob(&split_debuginfo_obj))?;
+                    let split_debuginfo_dwo = dir_glob.join(format!("{}.*.dwo", crate_name));
+                    f(GlobOrPath::Glob(&split_debuginfo_dwo))?;
+
+                    // Remove the uplifted copy.
+                    if let Some(uplift_dir) = uplift_dir {
+                        let uplifted_path = uplift_dir.join(file_type.uplift_filename(target));
+                        f(GlobOrPath::Path(&uplifted_path))?;
+                        // Dep-info generated by Cargo itself.
+                        let dep_info = uplifted_path.with_extension("d");
+                        f(GlobOrPath::Path(&dep_info))?;
+                    }
                 }
+
+                // TODO: what to do about build_script_build?
+                let dir = escape_glob_path(layout.incremental())?;
+                let incremental = Path::new(&dir).join(format!("{}-*", crate_name));
+                f(GlobOrPath::Glob(&incremental))?;
             }
         }
     }
@@ -224,48 +299,57 @@ fn escape_glob_path(pattern: &Path) -> CargoResult<String> {
     Ok(glob::Pattern::escape(pattern))
 }
 
-fn rm_rf_glob(pattern: &Path, config: &Config) -> CargoResult<()> {
+fn count_paths_in(path: &Path) -> usize {
+    walkdir::WalkDir::new(path).into_iter().count()
+}
+
+fn count_paths_in_glob(pattern: &Path) -> CargoResult<usize> {
+    let pattern = pattern
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("expected utf-8 path"))?;
+
+    glob::glob(pattern)?
+        .map(|path| Ok(count_paths_in(&path?)))
+        .sum()
+}
+
+fn rm_rf_glob(
+    pattern: &Path,
+    config: &Config,
+    progress: &mut CleaningProgressBar<'_>,
+) -> CargoResult<()> {
     // TODO: Display utf8 warning to user?  Or switch to globset?
     let pattern = pattern
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("expected utf-8 path"))?;
     for path in glob::glob(pattern)? {
-        rm_rf(&path?, config)?;
+        rm_rf(&path?, config, progress)?;
     }
     Ok(())
 }
 
-fn rm_rf_with_progress(path: &Path, progress: &mut Progress<'_>) -> CargoResult<()> {
-    let num_paths = walkdir::WalkDir::new(path).into_iter().count();
-    for (idx, entry) in walkdir::WalkDir::new(path)
-        .contents_first(true)
-        .into_iter()
-        .enumerate()
-    {
-        progress.tick(std::cmp::min(idx + 1, num_paths), num_paths, "")?;
-        if let Ok(entry) = entry {
-            if entry.file_type().is_dir() {
-                paths::remove_dir(entry.path())?;
-            } else {
-                paths::remove_file(entry.path())?;
-            }
+fn rm_rf(path: &Path, config: &Config, progress: &mut CleaningProgressBar<'_>) -> CargoResult<()> {
+    if fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+
+    config
+        .shell()
+        .verbose(|shell| shell.status("Removing", path.display()))?;
+    progress.display_now()?;
+    for entry in walkdir::WalkDir::new(path).contents_first(true) {
+        progress.tick()?;
+        let entry = entry?;
+        if entry.file_type().is_dir() {
+            paths::remove_dir(entry.path()).with_context(|| "could not remove build directory")?;
+        } else {
+            paths::remove_file(entry.path()).with_context(|| "failed to remove build artifact")?;
         }
     }
     Ok(())
 }
 
-fn rm_rf(path: &Path, config: &Config) -> CargoResult<()> {
-    let m = fs::symlink_metadata(path);
-    if m.as_ref().map(|s| s.is_dir()).unwrap_or(false) {
-        config
-            .shell()
-            .verbose(|shell| shell.status("Removing", path.display()))?;
-        paths::remove_dir_all(path).with_context(|| "could not remove build directory")?;
-    } else if m.is_ok() {
-        config
-            .shell()
-            .verbose(|shell| shell.status("Removing", path.display()))?;
-        paths::remove_file(path).with_context(|| "failed to remove build artifact")?;
-    }
-    Ok(())
+fn rm_rf_with_progress(path: &Path, config: &Config) -> CargoResult<()> {
+    let mut progress = CleaningProgressBar::new(config, count_paths_in(path));
+    rm_rf(path, config, &mut progress)
 }
